@@ -93,6 +93,29 @@ ssh-keygen -t ed25519 -N '' -C simple-next-deploy -f ~/.ssh/simple_next_deploy
 cat ~/.ssh/simple_next_deploy.pub
 ```
 
+**Bắt buộc: public key phải nằm trong `authorized_keys` của user SSH.** Runner
+GitHub Actions giữ *private* key, nên VPS phải tin *public* key đó. Thiếu bước này
+thì mọi lần deploy đều fail `Permission denied (publickey)` — private key có đúng
+cũng vậy. Làm đúng **user** sẽ điền vào secret `VPS_USER`:
+
+```bash
+# chạy đúng user mà bạn sẽ điền vào secret VPS_USER
+cat ~/.ssh/simple_next_deploy.pub >> ~/.ssh/authorized_keys
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/authorized_keys
+```
+
+Phải là **user đã `chown` thư mục app ở §2.3** — `deploy.sh` cần user đó ghi vào
+`/opt/simple-next-*` và chạy pm2. Kiểm tra lại bằng cách thử SSH từ máy local,
+đúng như runner sẽ làm:
+
+```bash
+ssh -i ~/.ssh/simple_next_deploy <VPS_USER>@<IP-VPS> 'echo OK && whoami'
+```
+
+Chỉ khi câu này ra `OK` thì GitHub Actions mới SSH được. Nếu vẫn bị
+`Permission denied (publickey)` xem mục chẩn đoán ở §3.1.
+
 Lấy fingerprint và add **read-only deploy key** trong GitHub
 (Settings → Deploy keys → Add deploy key, **KHÔNG** tick "Allow write access").
 
@@ -173,6 +196,28 @@ mất nginx cho **cả VPS**:
    `server {}`. Đây là chỗ dễ vấp nhất: file này dùng `simple_next_prod` /
    `simple_next_staging`, còn mom-baby dùng `mom_baby_prod` / `mom_baby_staging`.
    Nếu cả hai cùng đặt `upstream prod` thì `nginx -t` báo `duplicate upstream`.
+4. **`proxy_*` không được đặt ở top level của file.** Đây là bẫy thật đã gặp, và
+   nó **không** hiện trong bảng trên vì trông có vẻ "vô hại". File trong
+   `sites-enabled/` được `include` vào **bên trong** `http{}`, nên top level của
+   file = context `http{}` — **dùng chung với mọi project khác**. Mỗi directive
+   giá trị đơn (`proxy_http_version`, `proxy_buffering`, `proxy_buffers`,
+   `proxy_connect_timeout`, `proxy_read_timeout`, ...) chỉ nhận **một** lần cho mỗi
+   block, nên hai project cùng khai ở top level là:
+
+   ```
+   nginx: [emerg] "proxy_http_version" directive is duplicate in
+   /etc/nginx/sites-enabled/simple-next:30
+   ```
+
+   ⇒ **đặt mọi `proxy_*` vào trong từng `server {}`**, để mỗi project tự chứa.
+   (`proxy_set_header` không bị báo vì là directive kiểu block nên nginx cho gộp —
+   nhưng để nó ở `http{}` vẫn làm header của project này áp lên project khác.)
+   Lỗi báo ở file đọc **sau** trong thứ tự alphabet của `sites-enabled/*`
+   (`mom-baby` < `simple-next`), nên file bị chỉ đích không phải file "có vấn đề".
+
+   Hệ quả khi thêm block `listen 443 ssl` sau này: block mới phải **copy lại** khối
+   `proxy_*` (đặt trong `server` không được `listen 8019` kế thừa). Thiếu thì
+   `X-Forwarded-Proto` không được set ⇒ trang `/` hiện `(missing)`.
 
 **`sites-enabled/default` phải bị gỡ** — nhưng **không phải vì simple-next**. File
 `default` của Ubuntu cũng khai `listen 80 default_server`, mà `mom-baby` dùng chính
@@ -198,6 +243,10 @@ sudo install -m 644 /opt/simple-next-prod/deploy/vps/nginx.conf /etc/nginx/sites
 
 sudo nginx -t && sudo systemctl reload nginx
 ```
+
+⚠️ `/etc/nginx/sites-available/*` **KHÔNG** tự cập nhật theo repo — `deploy.sh` không
+đụng tới nginx (xem §2.6). Sửa `deploy/vps/nginx.conf` trong repo thì phải chạy lại
+lệnh `install` ở trên mới có hiệu lực trên VPS.
 
 Kiểm tra:
 
@@ -228,7 +277,12 @@ Repo → Settings → **Secrets and variables → Actions → New repository sec
 |---|---|---|
 | `VPS_HOST` | `203.0.113.10` | IP VPS, không phải domain |
 | `VPS_USER` | `ubuntu` | user chạy pm2, **không phải root** |
-| `SSH_PRIVATE_KEY` | nội dung `~/.ssh/simple_next_deploy` | dán **nguyên văn** file private key, có header `-----BEGIN OPENSSH PRIVATE KEY-----` và footer; không bọc dấu nháy, không bỏ dòng nào |
+| `SSH_PRIVATE_KEY` | nội dung `~/.ssh/simple_next_deploy` | dán **nguyên văn** file private key, có header `-----BEGIN OPENSSH PRIVATE KEY-----` và footer; không bọc dấu nháy, không bỏ dòng nào; **xuống dòng LF**, không CRLF |
+
+`SSH_PRIVATE_KEY` phải là **private key đúng cặp** với public key đã nằm trong
+`~/.ssh/authorized_keys` của `VPS_USER` trên VPS (§2.3). Dán từ Notepad/Word trên
+Windows sẽ kẹp `\r` CRLF, mà OpenSSH parse private key bằng text nên key không đọc
+được. Workflow đã có `tr -d '\r'` nên chống được, nhưng nên dán cho đúng ngay.
 
 Hai biến tuỳ chọn là **Variables** (không phải Secret) vì chúng không bí mật:
 
@@ -263,6 +317,38 @@ Bảo vệ tương đương "protected variable" của GitLab là **Environment 
 tạo environment `prod`, thêm rule "Required reviewers" để chỉ workflow được duyệt mới
 nhận secret `prod-*`. Lưu ý *required reviewers* chỉ miễn phí với repo **public**;
 repo private cần Pro/Team/Enterprise. Repo public thì runner free không giới hạn phút.
+
+### 3.1 Chẩn đoán `Permission denied (publickey)`
+
+Có 3 tầng, kiểm tra từ trên xuống vì mỗi tầng loại được một nhóm nguyên nhân:
+
+1. **Key trong secret có đọc được không?** Bước *Ghi deploy key* chạy
+   `ssh-keygen -y -f ~/.ssh/deploy_key`; nếu job dừng ở đó thì key hỏng (thiếu
+   header/footer, hoặc dán thiếu dòng) — sửa lại secret.
+2. **Job có chạy tới bước deploy không?** Nếu có, tầng 1 đã pass ⇒ key hợp lệ,
+   lỗi nằm ở VPS.
+3. **Test tay từ máy local**, đúng như runner:
+
+   ```bash
+   ssh -i ~/.ssh/simple_next_deploy -o IdentitiesOnly=yes <VPS_USER>@<IP-VPS> 'echo OK && whoami'
+   ```
+
+   Không ra `OK` thì kiểm tra trên VPS, đúng user đó:
+
+   ```bash
+   # public key có trong authorized_keys không, và có đúng fingerprint không
+   ssh-keygen -lf ~/.ssh/authorized_keys
+   ssh-keygen -lf ~/.ssh/simple_next_deploy.pub     # hai dòng phải trùng
+   ls -ld ~/.ssh && ls -l ~/.ssh/authorized_keys    # phải 700 / 600
+   sudo sshd -T | grep -Ei 'pubkeyauthentication|authorizedkeysfile|allowusers'
+   ```
+
+| Triệu chứng | Nguyên nhân |
+|---|---|
+| `authorized_keys` không có dòng nào / thiếu fingerprint | chưa làm bước `>> ~/.ssh/authorized_keys` ở §2.3 |
+| có key nhưng vẫn bị từ chối, dán tay từ local cũng bị | sai `VPS_USER`, hoặc `sshd` chặn (`AllowUsers`, `PubkeyAuthentication no`) |
+| dán tay từ local được, Actions thì không | secret `SSH_PRIVATE_KEY` dán dở / khác cặp / CRLF — quay lại tầng 1 |
+| `Bad permissions` trong log ssh | `chmod 700 ~/.ssh` + `chmod 600 ~/.ssh/authorized_keys` |
 
 ## 4. Deploy / quay lại bản cũ (thủ công)
 
