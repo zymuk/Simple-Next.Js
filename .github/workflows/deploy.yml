@@ -113,8 +113,15 @@ jobs:
       - name: Ghi deploy key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id
-          chmod 600 ~/.ssh/id
+          chmod 700 ~/.ssh
+          # `tr -d '\r'` BẮT BUỘC: secret dán từ Windows hay mang CRLF, còn OpenSSH
+          # parse private key bằng text — gặp \r thì key không đọc được và lỗi hiện
+          # ra thành "Permission denied (publickey)" chứ không báo nguyên nhân.
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Chặn sai SỚM: key hỏng hoặc thiếu header/footer thì fail ở đây với log
+          # rõ ràng, thay vì đẩy xuống bước deploy thành publickey vô nghĩa.
+          ssh-keygen -y -f ~/.ssh/deploy_key >/dev/null
 
       # `ssh-keyscan` là TOAN (trust on first use) — chấp nhận được ở đây vì runner
       # là container sạch mỗi lần, không có known_hosts để đối chiếu. Ràng chặn thật
@@ -122,12 +129,17 @@ jobs:
       - name: ssh-keyscan
         run: ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
 
+      # `-i` là bắt buộc: ssh chỉ tự thử các tên key mặc định (id_rsa, id_ed25519,
+      # ...). File ta ghi là `deploy_key` nên không có `-i` thì ssh đưa ra key nào
+      # cho server cả → "Permission denied (publickey)". `IdentitiesOnly=yes` chặn
+      # ssh thử key khác (ví dụ key do runner sinh) trước khi tới key của ta.
       - name: Deploy staging
         if: ${{ github.ref_name == 'dev' || (github.event_name == 'workflow_dispatch' && inputs.target == 'staging') }}
         run: |
           BRANCH="${{ inputs.ref || github.ref_name }}"
           DIR="${{ vars.VPS_STAGING_DIR || '/opt/simple-next-staging' }}"
-          ssh -o StrictHostKeyChecking=no "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
             "cd '$DIR' && bash deploy/vps/deploy.sh '$BRANCH' staging"
 
       - name: Deploy prod
@@ -135,5 +147,6 @@ jobs:
         run: |
           BRANCH="${{ inputs.ref || github.ref_name }}"
           DIR="${{ vars.VPS_PROD_DIR || '/opt/simple-next-prod' }}"
-          ssh -o StrictHostKeyChecking=no "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
             "cd '$DIR' && bash deploy/vps/deploy.sh '$BRANCH' prod"
