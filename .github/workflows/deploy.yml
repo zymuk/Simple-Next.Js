@@ -11,14 +11,15 @@
 # (không tốn phút runner) nhưng tốn RAM trên VPS — xem docs §2.2 (swap).
 #
 # NGUYÊN TẦN 1 — gate và deploy ĐỘC LẬP.
-# - `deploy` có `if: ${{ !cancelled() }}` + `needs` ⇒ chạy KỂ CẢ khi gate đỏ. Gate đỏ
-#   là tín hiệu cho người, KHÔNG phải chốt chặn việc cập nhật server — người đã
-#   quyết định xem có deploy hay không.
+# - `deploy` có `if: ${{ !cancelled() && vars.DEPLOY_ENABLED == 'true' }}` + `needs`
+#   ⇒ chạy KỂ CẢ khi gate đỏ. Gate đỏ là tín hiệu cho người, KHÔNG phải chốt chặn việc
+#   cập nhật server — người đã quyết định xem có deploy hay không. `DEPLOY_ENABLED`
+#   là cổng tắt duy nhất (repo mới, chưa có VPS) — bỏ nó thì job skip vĩnh viễn.
 # - Không có `continue-on-error` ở deploy: nếu build hỏng thì `deploy.sh` dừng ở đó,
 #   không đụng app đang chạy, trả exit 1. Ranh giới an toàn là "build được +
 #   /api/health khoẹe", không phải gate CI.
-# - `needs` mà thiếu `if: !cancelled()` là deploy BỊ SKIP khi gate đỏ — mất hẳn
-#   tính năng "deploy luôn chạy". Đừng bỏ dòng `if`.
+# - `needs` mà thiếu `if` là deploy BỊ SKIP khi gate đỏ — mất hẳn tính năng
+#   "deploy luôn chạy". Đừng bỏ vế `!cancelled()`.
 #
 # NGUYÊN TẦN 2 — deploy nối tiếp, không cắt ngang.
 # - `concurrency` (tương đương `resource_group` của GitLab) với
@@ -88,9 +89,18 @@ jobs:
   #   SSH_PRIVATE_KEY (private key của deploy key) · VPS_PROD_DIR · VPS_STAGING_DIR.
   # `SSH_PRIVATE_KEY` nhận nội dung file kèm header `-----BEGIN OPENSSH PRIVATE
   # KEY-----` và footer — dán nguyên văn, không có dấu nháy bao ngoài.
+  #
+  # CỔNG BẬT/TẮT: `vars.DEPLOY_ENABLED` phải bằng chuỗi `true` thì deploy mới chạy.
+  # Chưa bật (hoặc chưa tạo VPS) thì job bị SKIP ⇒ push lên dev/main chỉ chạy gate
+  # và workflow XANH, thay vì đỏ vì `ssh` với host/user rỗng. Bật lại bằng cách tạo
+  # repository variable `DEPLOY_ENABLED` = `true` (Variables, KHÔNG phải Secrets —
+  # nó không bí mật, và `vars` là context hợp lệ trong `jobs.<id>.if` còn `secrets`
+  # thì không).
+  #   Settings → Secrets and variables → Actions → Variables → New repository
+  #   variable: DEPLOY_ENABLED = true
   deploy:
     needs: gate
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && vars.DEPLOY_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:

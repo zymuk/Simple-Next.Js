@@ -181,12 +181,22 @@ Hai biến tuỳ chọn là **Variables** (không phải Secret) vì chúng khô
 
 | Variable | Mặc định trong workflow |
 |---|---|
+| `DEPLOY_ENABLED` | **mặc định tắt** — phải đặt `true` mới deploy |
 | `VPS_PROD_DIR` | `/opt/simple-next-prod` |
 | `VPS_STAGING_DIR` | `/opt/simple-next-staging` |
 
+`DEPLOY_ENABLED` là **cổng bật/tắt** của job `deploy`
+(`if: ${{ !cancelled() && vars.DEPLOY_ENABLED == 'true' }}`). Chưa tạo variable này thì
+job bị **skip** ⇒ push vào `dev`/`main` chỉ chạy gate và workflow **xanh**. Đây là
+trạng thái bình thường lúc mới lấy repo về: đừng tạo VPS, đừng điền secret gì cả.
+
+Đặt `DEPLOY_ENABLED = true` khi đã xong §2 (VPS + deploy key) và thêm 3 secret ở
+bảng trên. Xóa variable = tắt deploy trở lại mà không sửa file nào.
+
 Deploy tự động: push vào `dev` → staging; vào `main` → prod. **Deploy luôn chạy, kể cả
 khi gate đỏ** (`if: ${{ !cancelled() }}` + `needs`) — gate đỏ là cảnh báo để bạn quyết
-định, không phải chốt chặn. Bỏ dòng `if` đó là deploy bị skip khi gate đỏ.
+định, không phải chốt chặn. Bỏ vế `!cancelled()` khỏi dòng `if` là deploy bị skip khi
+gate đỏ.
 
 Deploy **không** chạy trong `pull_request` (workflow chỉ khai báo `on: push`), nên mỗi
 PR không tốn một lần build trên VPS. Ngoài ra GitHub không cấp secret cho workflow
