@@ -1,8 +1,8 @@
 # Triển khai simple-next lên VPS Ubuntu (pm2 + nginx, không Docker)
 
-Next.js 15 App Router, chạy bằng `next start` dưới pm2, nginx làm reverse proxy.
-Cùng mô hình với `mom-baby-app`, khác ở chỗ app rất nhỏ, cổng riêng để chạy song song
-trên cùng VPS, và CI là **GitHub Actions** (`.github/workflows/deploy.yml`).
+Next.js 16 App Router, chạy bằng `next start` dưới pm2, nginx làm reverse proxy.
+App rất nhỏ, mỗi môi trường một thư mục riêng trên VPS, CI là **GitHub Actions**
+(`.github/workflows/deploy.yml`).
 
 ## 1. Kiến trúc
 
@@ -10,8 +10,6 @@ trên cùng VPS, và CI là **GitHub Actions** (`.github/workflows/deploy.yml`).
 |---|---|---|---|---|
 | staging | `dev` | `:8018` | `127.0.0.1:3118` | `http://<IP-VPS>:8018` |
 | prod | `main` | `:8019` | `127.0.0.1:3119` | `http://<IP-VPS>:8019` |
-
-Cổng khác `mom-baby-app` (`:80 → 3000`, `:8001 → 3002`) để không đụng nhau.
 
 App chỉ lắng nghe trên loopback → **không truy cập trực tiếp được**, mọi request đi qua
 nginx (giữ `X-Real-IP` / `X-Forwarded-Proto` mà trang `/` hiển thị để kiểm chứng).
@@ -39,8 +37,8 @@ rồi nên không tốn downtime, và app này build lại chỉ vài chục gi�
 
 **Đánh đổi của mô hình build-tại-chỗ:** `npm run build` ghi đè `.next` của đúng thư mục
 app đang chạy nên phải `pm2 stop` trước ⇒ downtime mỗi lần deploy bằng thời gian build
-(với app này chỉ ~15–30s, không phải 3–5 phút như mom-baby), và rollback cũng phải build
-lại. Đổi lại không tốn ~300MB mỗi bản, không có symlink trỏ treo.
+(với app này chỉ ~15–30s), và rollback cũng phải build lại. Đổi lại không tốn ~300MB mỗi
+bản, không có symlink trỏ treo.
 
 `npm ci` **không** chạy mỗi lần — chỉ khi `package.json`/`package-lock.json` đổi so với
 commit đang chạy, hoặc `node_modules` chưa có. Bỏ hẳn `npm ci` thì sai: commit mới thêm
@@ -179,65 +177,53 @@ target chưa tồn tại — nó tạo symlink treo, `nginx -t` sẽ fail với
 `open() ".../sites-enabled/simple-next" failed (2: No such file or directory)`. Sửa: chạy
 lại đúng chuỗi trên (tạo file đích trước rồi mới link).
 
-### 2.5b Nhiều project trên cùng một VPS
+### 2.5b Thêm site khác vào cùng một VPS
 
 nginx chỉ có MỘT config toàn cục (`/etc/nginx/nginx.conf` → `include
-sites-enabled/*`). Mỗi project là 1 cặp file riêng trong `sites-available/` +
-`sites-enabled/`; **không** sửa file của project khác.
+sites-enabled/*`). Mỗi site là 1 cặp file riêng trong `sites-available/` +
+`sites-enabled/`; **không** sửa file của site khác.
 
-Ba thứ phải không trùng, trùng là `nginx -t` fail ⇒ `systemctl reload` không chạy ⇒
-mất nginx cho **cả VPS**:
+Ba thứ phải không trùng với site khác, trùng là `nginx -t` fail ⇒ `systemctl reload`
+không chạy ⇒ mất nginx cho **cả VPS**:
 
-1. **Tên file** trong `sites-available`/`sites-enabled` (`simple-next` vs `mom-baby`).
-2. **Cổng `listen`.** Đang phân bổ: mom-baby `80` (prod) + `8001` (staging) →
-   `127.0.0.1:3000/3002`; simple-next `8019` (prod) + `8018` (staging) →
-   `127.0.0.1:3119/3118`.
+1. **Tên file** trong `sites-available`/`sites-enabled` (ví dụ `simple-next`).
+2. **Cổng `listen`.** File này dùng `8019` (prod) + `8018` (staging). Khi thêm site mới
+   thì chọn cổng chưa ai dùng, và nhớ mở firewall theo cổng nginx — **không** mở cổng
+   app (`3119`/`3118`), vì app chỉ nghe loopback.
 3. **Tên `upstream`** — `upstream` là namespace **toàn cục**, không nằm trong
-   `server {}`. Đây là chỗ dễ vấp nhất: file này dùng `simple_next_prod` /
-   `simple_next_staging`, còn mom-baby dùng `mom_baby_prod` / `mom_baby_staging`.
-   Nếu cả hai cùng đặt `upstream prod` thì `nginx -t` báo `duplicate upstream`.
+   `server {}`. File này dùng `simple_next_prod` / `simple_next_staging`; **tên phải có
+   tiền tố của app**. Hai site cùng đặt `upstream prod` thì `nginx -t` báo
+   `duplicate upstream`.
 4. **`proxy_*` không được đặt ở top level của file.** Đây là bẫy thật đã gặp, và
    nó **không** hiện trong bảng trên vì trông có vẻ "vô hại". File trong
    `sites-enabled/` được `include` vào **bên trong** `http{}`, nên top level của
-   file = context `http{}` — **dùng chung với mọi project khác**. Mỗi directive
-   giá trị đơn (`proxy_http_version`, `proxy_buffering`, `proxy_buffers`,
-   `proxy_connect_timeout`, `proxy_read_timeout`, ...) chỉ nhận **một** lần cho mỗi
-   block, nên hai project cùng khai ở top level là:
+   file = context `http{}` — **dùng chung với mọi site khác, kể cả file trong
+   `conf.d/`**. Mỗi directive giá trị đơn (`proxy_http_version`, `proxy_buffering`,
+   `proxy_buffers`, `proxy_connect_timeout`, `proxy_read_timeout`, ...) chỉ nhận
+   **một** lần cho mỗi block, nên chỉ cần một file khác khai ở top level là:
 
    ```
    nginx: [emerg] "proxy_http_version" directive is duplicate in
    /etc/nginx/sites-enabled/simple-next:30
    ```
 
-   ⇒ **đặt mọi `proxy_*` vào trong từng `server {}`**, để mỗi project tự chứa.
+   ⇒ **đặt mọi `proxy_*` vào trong từng `server {}`**, để file này tự chứa.
    (`proxy_set_header` không bị báo vì là directive kiểu block nên nginx cho gộp —
-   nhưng để nó ở `http{}` vẫn làm header của project này áp lên project khác.)
-   Lỗi báo ở file đọc **sau** trong thứ tự alphabet của `sites-enabled/*`
-   (`mom-baby` < `simple-next`), nên file bị chỉ đích không phải file "có vấn đề".
+   nhưng để nó ở `http{}` vẫn làm header áp lên site khác.)
+   Lỗi báo ở file đọc **sau** theo thứ tự alphabet của `sites-enabled/*`, nên file bị
+   chỉ đích không phải file "có vấn đề".
 
    Hệ quả khi thêm block `listen 443 ssl` sau này: block mới phải **copy lại** khối
    `proxy_*` (đặt trong `server` không được `listen 8019` kế thừa). Thiếu thì
    `X-Forwarded-Proto` không được set ⇒ trang `/` hiện `(missing)`.
 
-**`sites-enabled/default` phải bị gỡ** — nhưng **không phải vì simple-next**. File
-`default` của Ubuntu cũng khai `listen 80 default_server`, mà `mom-baby` dùng chính
-cổng 80 với `default_server` (`listen 80 default_server` trong
-`deploy/vps/nginx.conf` của nó) ⇒ hai block cùng làm default trên `:80` ⇒
-`duplicate default server for 0.0.0.0:80`. mom-baby đã gỡ file này trong
-setup của nó; simple-next chỉ cần đảm bảo nó vẫn vắng:
+File này dùng cổng riêng `8019`/`8018` và **không** khai `default_server`, nên không
+cần đụng tới `sites-enabled/default` của Ubuntu. (Chỉ gỡ nó nếu sau này bạn thêm một
+site dùng `listen 80 default_server` — nếu không, gỡ đi là thừa.)
+
+Cài (chạy 1 lần):
 
 ```bash
-sudo rm -f /etc/nginx/sites-enabled/default
-```
-
-Thứ tự cài (chạy 1 lần; cài mom-baby trước vì nó giữ `default_server` trên :80):
-
-```bash
-sudo install -m 644 /opt/mom-baby-prod/deploy/vps/nginx.conf /etc/nginx/sites-available/mom-baby \
-  && sudo ln -sfn /etc/nginx/sites-available/mom-baby /etc/nginx/sites-enabled/mom-baby
-
-sudo rm -f /etc/nginx/sites-enabled/default
-
 sudo install -m 644 /opt/simple-next-prod/deploy/vps/nginx.conf /etc/nginx/sites-available/simple-next \
   && sudo ln -sfn /etc/nginx/sites-available/simple-next /etc/nginx/sites-enabled/simple-next
 
@@ -252,12 +238,12 @@ Kiểm tra:
 
 ```bash
 ls -l /etc/nginx/sites-enabled/
-sudo ss -ltnp | grep -E ':(80|8001|3118|3119|8018|8019)\b'
-curl -sI http://127.0.0.1:80   | head -1   # mom-baby prod
-curl -sI http://127.0.0.1:8019 | head -1   # simple-next prod
+sudo ss -ltnp | grep -E ':(3118|3119|8018|8019)\b'
+curl -sI http://127.0.0.1:8019 | head -1   # prod
+curl -sI http://127.0.0.1:8018 | head -1   # staging
 ```
 
-Khi cả hai lên HTTPS, cùng phải khai `listen 443 ssl` — lúc đó chỉ MỘT block được
+Khi lên HTTPS, khai `listen 443 ssl` — nếu VPS có nhiều site thì chỉ MỘT block được
 `default_server`, các block còn lại bắt buộc có `server_name` khác nhau, nếu không
 lại dính `duplicate default server`.
 

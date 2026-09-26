@@ -1,7 +1,7 @@
 # simple-next
 
 App Next.js tối giản, mục đích chính là **test deploy lên VPS** qua GitHub Actions →
-SSH → VPS (pm2 + nginx, không Docker), cùng mô hình với `mom-baby-app`.
+SSH → VPS (pm2 + nginx, không Docker).
 
 | Môi trường | Nhánh | nginx | Next.js | URL |
 |---|---|---|---|---|
