@@ -1,0 +1,129 @@
+# Deploy simple-next lên VPS (self-host: pm2 + nginx, KHÔNG Docker).
+#
+# Luồng: push vào `dev`  → gate chất lượng → deploy staging (http://IP:8018)
+#        push vào `main` → gate chất lượng → deploy prod    (http://IP:8019)
+# Mỗi môi trường là 1 thư mục riêng trên VPS:
+#   /opt/simple-next-staging (branch dev) · /opt/simple-next-prod (branch main).
+#
+# Workflow KHÔNG build — nó SSH vào VPS và chạy `deploy/vps/deploy.sh` build + phát
+# hành tại chỗ (xem docs/deploy-vps.md). Deploy script tự rollback về bản trước nếu
+# `/api/health` không khỏe. Hệ quả: `npm run build` chạy ngoài GitHub Actions
+# (không tốn phút runner) nhưng tốn RAM trên VPS — xem docs §2.2 (swap).
+#
+# NGUYÊN TẦN 1 — gate và deploy ĐỘC LẬP.
+# - `deploy` có `if: ${{ !cancelled() }}` + `needs` ⇒ chạy KỂ CẢ khi gate đỏ. Gate đỏ
+#   là tín hiệu cho người, KHÔNG phải chốt chặn việc cập nhật server — người đã
+#   quyết định xem có deploy hay không.
+# - Không có `continue-on-error` ở deploy: nếu build hỏng thì `deploy.sh` dừng ở đó,
+#   không đụng app đang chạy, trả exit 1. Ranh giới an toàn là "build được +
+#   /api/health khoẹe", không phải gate CI.
+# - `needs` mà thiếu `if: !cancelled()` là deploy BỊ SKIP khi gate đỏ — mất hẳn
+#   tính năng "deploy luôn chạy". Đừng bỏ dòng `if`.
+#
+# NGUYÊN TẦN 2 — deploy nối tiếp, không cắt ngang.
+# - `concurrency` (tương đương `resource_group` của GitLab) với
+#   `cancel-in-progress: false`: push mới không cắt ngang lúc đang phát hành, và
+#   hai deploy (staging + prod) không chạy song sinh `npm run build` trên VPS.
+# - `timeout-minutes` vì `deploy.sh` có thể build + rollback (build lại lần nữa).
+#
+# Không có deploy trong `pull_request`: PR review không đổi server nào, mỗi PR lại
+# tốn trọn một lần build trên VPS. (Ngoài ra secret không được cấp cho workflow
+# chạy bởi PR từ fork — xem docs §3.)
+name: deploy
+
+on:
+  push:
+    branches: [dev, main]
+  # Bấm "Run workflow" tay trên tab Actions (deploy lại bản đã có, vd khi VPS vừa
+  # được setup lại). `workflow_dispatch` có secret như bình thường.
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Môi trường cần deploy
+        type: choice
+        options: [prod, staging]
+        default: prod
+      ref:
+        description: Branch hoặc commit SHA (bỏ trống = nhánh theo môi trường)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+# ── Gate chất lượng ────────────────────────────────────────────────────────────
+# `npm ci` dùng cache của repo (khóa theo package-lock.json). Bỏ `continue-on-error`:
+# gate đỏ phải làm workflow đỏ, đó là tín hiệu cho người.
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Cài dependencies
+        run: npm ci --prefer-offline --no-audit --fund=false
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # `npm run build` không cần env: `/` và `/api/health` force-dynamic, đọc env ở
+      # request-time chứ không ở build-time. `NEXT_PUBLIC_GIT_SHA` thiếu cũng không
+      # sao — deploy.sh export giá trị thật ngay trước khi build trên VPS.
+      - name: Build check
+        run: npm run build
+
+      # KHÔNG chặn deploy: nhiều CVE transitive không sửa được ngay.
+      - name: Audit dependency
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
+  # ── Deploy VPS (SSH → deploy/vps/deploy.sh) ─────────────────────────────────
+  # Cần GitHub Secrets (Settings → Secrets and variables → Actions):
+  #   VPS_HOST (IP VPS) · VPS_USER (user thường, KHÔNG root) ·
+  #   SSH_PRIVATE_KEY (private key của deploy key) · VPS_PROD_DIR · VPS_STAGING_DIR.
+  # `SSH_PRIVATE_KEY` nhận nội dung file kèm header `-----BEGIN OPENSSH PRIVATE
+  # KEY-----` và footer — dán nguyên văn, không có dấu nháy bao ngoài.
+  deploy:
+    needs: gate
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: vps-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Cài ssh client
+        run: sudo apt-get update && sudo apt-get install -y openssh-client
+
+      - name: Ghi deploy key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id
+          chmod 600 ~/.ssh/id
+
+      # `ssh-keyscan` là TOAN (trust on first use) — chấp nhận được ở đây vì runner
+      # là container sạch mỗi lần, không có known_hosts để đối chiếu. Ràng chặn thật
+      # sự là deploy key chỉ có quyền đúng 1 việc.
+      - name: ssh-keyscan
+        run: ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Deploy staging
+        if: ${{ github.ref_name == 'dev' || (github.event_name == 'workflow_dispatch' && inputs.target == 'staging') }}
+        run: |
+          BRANCH="${{ inputs.ref || github.ref_name }}"
+          DIR="${{ vars.VPS_STAGING_DIR || '/opt/simple-next-staging' }}"
+          ssh -o StrictHostKeyChecking=no "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            "cd '$DIR' && bash deploy/vps/deploy.sh '$BRANCH' staging"
+
+      - name: Deploy prod
+        if: ${{ github.ref_name == 'main' || (github.event_name == 'workflow_dispatch' && inputs.target == 'prod') }}
+        run: |
+          BRANCH="${{ inputs.ref || github.ref_name }}"
+          DIR="${{ vars.VPS_PROD_DIR || '/opt/simple-next-prod' }}"
+          ssh -o StrictHostKeyChecking=no "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            "cd '$DIR' && bash deploy/vps/deploy.sh '$BRANCH' prod"

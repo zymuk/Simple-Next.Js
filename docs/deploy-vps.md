@@ -1,0 +1,271 @@
+# Triển khai simple-next lên VPS Ubuntu (pm2 + nginx, không Docker)
+
+Next.js 15 App Router, chạy bằng `next start` dưới pm2, nginx làm reverse proxy.
+Cùng mô hình với `mom-baby-app`, khác ở chỗ app rất nhỏ, cổng riêng để chạy song song
+trên cùng VPS, và CI là **GitHub Actions** (`.github/workflows/deploy.yml`).
+
+## 1. Kiến trúc
+
+| Môi trường | Nhánh | nginx | Next.js | URL |
+|---|---|---|---|---|
+| staging | `dev` | `:8018` | `127.0.0.1:3118` | `http://<IP-VPS>:8018` |
+| prod | `main` | `:8019` | `127.0.0.1:3119` | `http://<IP-VPS>:8019` |
+
+Cổng khác `mom-baby-app` (`:80 → 3000`, `:3001 → 3002`) để không đụng nhau.
+
+App chỉ lắng nghe trên loopback → **không truy cập trực tiếp được**, mọi request đi qua
+nginx (giữ `X-Real-IP` / `X-Forwarded-Proto` mà trang `/` hiển thị để kiểm chứng).
+
+Mỗi môi trường là **một thư mục git clone thường**, không chung nhau:
+
+```
+/opt/simple-next-prod/          (hoặc -staging)
+├── .git/            repo bình thường, HEAD = commit đang chạy (detached)
+├── node_modules/    cài lại khi lockfile đổi
+├── .next/           build tại chỗ
+└── deploy/vps/      script + ecosystem.config.cjs + nginx.conf (nằm trong repo)
+/opt/simple-next-secrets/        (TUỲ CHỌN — app này không có secret)
+├── prod.env
+└── staging.env
+```
+
+`deploy.sh` làm đúng: `git fetch` → `git checkout <commit>` → (`npm ci` **chỉ khi
+lockfile đổi**) → `pm2 stop` → `rm -rf .next` → `npm run build` → `pm2 start` → chờ
+`/api/health`. Mọi nhánh fail đều quay về commit trước rồi build lại.
+
+`rm -rf .next` trước khi build là cố ý: build chồng lên `.next` của commit trước từng
+gặp `PageNotFoundError: Cannot find module for page: /_document` (app vẫn `pm2 stop`
+rồi nên không tốn downtime, và app này build lại chỉ vài chục giây).
+
+**Đánh đổi của mô hình build-tại-chỗ:** `npm run build` ghi đè `.next` của đúng thư mục
+app đang chạy nên phải `pm2 stop` trước ⇒ downtime mỗi lần deploy bằng thời gian build
+(với app này chỉ ~15–30s, không phải 3–5 phút như mom-baby), và rollback cũng phải build
+lại. Đổi lại không tốn ~300MB mỗi bản, không có symlink trỏ treo.
+
+`npm ci` **không** chạy mỗi lần — chỉ khi `package.json`/`package-lock.json` đổi so với
+commit đang chạy, hoặc `node_modules` chưa có. Bỏ hẳn `npm ci` thì sai: commit mới thêm
+dependency sẽ chạy trên `node_modules` cũ — build xanh, `/api/health` xanh, rồi lúc dùng
+chức năng mới mới `MODULE_NOT_FOUND`.
+
+Thư mục clone ở trạng thái **detached HEAD** (đúng commit workflow deploy). Đừng
+`git pull` tay trong thư mục này — dùng `deploy.sh` để deploy lại qua đúng một đường.
+
+## 2. Chuẩn bị VPS (một lần)
+
+### 2.1 Công cụ
+
+```bash
+sudo apt update && sudo apt install -y nginx git curl
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt install -y nodejs
+sudo npm i -g pm2
+
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+# KHÔNG dùng `echo key >> known_hosts` — dùng ssh-keyscan:
+ssh-keyscan <IP-VPS> >> ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+```
+
+`known_hosts` ở đây là của **user bạn chạy pm2**, không phải root. Nếu dùng user khác để
+chạy app thì copy sang `~user/`.
+
+### 2.2 Swap
+
+Bắt buộc nếu VPS còn app khác đang chạy và không có swap:
+
+```bash
+sudo fallocate -l 4G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+free -h
+```
+
+### 2.3 Thư mục app + deploy key
+
+```bash
+# clone thường (KHÔNG --bare): đây chính là nơi app chạy, build tại chỗ
+sudo git clone https://github.com/zymuk/Simple-Next.Js.git /opt/simple-next-prod
+sudo git clone https://github.com/zymuk/Simple-Next.Js.git /opt/simple-next-staging
+
+# deploy key để `git fetch` được khi workflow đẩy commit mới
+ssh-keygen -t ed25519 -N '' -C simple-next-deploy -f ~/.ssh/simple_next_deploy
+cat ~/.ssh/simple_next_deploy.pub
+```
+
+Lấy fingerprint và add **read-only deploy key** trong GitHub
+(Settings → Deploy keys → Add deploy key, **KHÔNG** tick "Allow write access").
+
+Lưu ý: repo **private** thì deploy key phải có quyền truy cập repo đó; deploy key
+chỉ đọc, nên runner cần deploy key (chứ không phải token) để `git fetch`.
+
+```bash
+# user chạy pm2 được đọc/ghi trong thư mục app (npm ci/build tại chỗ cần ghi)
+sudo chown -R "$USER":"$USER" /opt/simple-next-prod /opt/simple-next-staging
+
+# firewall: chỉ mở SSH + HTTP + 2 cổng nginx của app này
+sudo ufw allow 22/tcp
+sudo ufw allow 8019/tcp
+sudo ufw allow 8018/tcp
+sudo ufw enable
+```
+
+Không mở `3119`/`3118` ra ngoài — app chỉ nghe loopback, mở cũng vô dụng.
+
+### 2.4 File env (tuỳ chọn)
+
+App này không có secret nào. Nếu muốn đặt `APP_MESSAGE` hoặc đổi `PORT`:
+
+```bash
+sudo mkdir -p /opt/simple-next-secrets
+sudo chmod 700 /opt/simple-next-secrets
+sudo chown -R "$USER":"$USER" /opt/simple-next-secrets
+sudo nano /opt/simple-next-secrets/prod.env   # và staging.env
+```
+
+Quy tắc để `deploy.sh` và `ecosystem.config.cjs` đọc được:
+
+- mỗi dòng đúng dạng `KEY=value`, không `export`, không thụt đầu dòng trước `KEY`
+- giá trị có thể bọc `"` hoặc `'`; **không** nội suy biến (`$VAR`, backtick)
+- không comment cùng dòng với giá trị
+
+Thiếu file env KHÔNG làm deploy fail (chỉ log cảnh báo).
+
+### 2.5 nginx + pm2
+
+Thư mục clone ở §2.3 là working tree bình thường nên `nginx.conf` nằm đúng chỗ.
+Kiểm tra file có trong commit đang checkout không (lần setup đầu, commit deploy có
+thể chưa có trên nhánh đó):
+
+```bash
+test -f /opt/simple-next-prod/deploy/vps/nginx.conf \
+  || git -C /opt/simple-next-prod fetch origin main && \
+     git -C /opt/simple-next-prod checkout -f origin/main
+```
+
+Rồi cài (giữ nguyên chuỗi `&&` — xem cảnh báo bên dưới):
+
+```bash
+sudo install -m 644 /opt/simple-next-prod/deploy/vps/nginx.conf /etc/nginx/sites-available/simple-next \
+  && sudo ln -sfn /etc/nginx/sites-available/simple-next /etc/nginx/sites-enabled/simple-next \
+  && sudo nginx -t && sudo systemctl reload nginx
+```
+
+⚠️ **Giữ nguyên chuỗi `&&`, đừng tách ra chạy từng dòng.** `ln -s` KHÔNG báo lỗi khi
+target chưa tồn tại — nó tạo symlink treo, `nginx -t` sẽ fail với
+`open() ".../sites-enabled/simple-next" failed (2: No such file or directory)`. Sửa: chạy
+lại đúng chuỗi trên (tạo file đích trước rồi mới link).
+
+Không `rm /etc/nginx/sites-enabled/default` ở đây (khác mom-baby) vì file này **không**
+dùng `listen 80 default_server` — xóa sẽ làm hỏng app kia.
+
+```bash
+# pm2 tự khởi động lại sau reboot
+pm2 startup systemd -u "$USER" --hp "$HOME"
+pm2 save
+```
+
+`pm2 startup` chỉ cần chạy 1 lần; `pm2 save` sau mỗi lần deploy (deploy.sh đã gọi).
+
+## 3. Secrets (GitHub Actions)
+
+Repo → Settings → **Secrets and variables → Actions → New repository secret**:
+
+| Secret | Ví dụ | Ghi chú |
+|---|---|---|
+| `VPS_HOST` | `203.0.113.10` | IP VPS, không phải domain |
+| `VPS_USER` | `ubuntu` | user chạy pm2, **không phải root** |
+| `SSH_PRIVATE_KEY` | nội dung `~/.ssh/simple_next_deploy` | dán **nguyên văn** file private key, có header `-----BEGIN OPENSSH PRIVATE KEY-----` và footer; không bọc dấu nháy, không bỏ dòng nào |
+
+Hai biến tuỳ chọn là **Variables** (không phải Secret) vì chúng không bí mật:
+
+| Variable | Mặc định trong workflow |
+|---|---|
+| `VPS_PROD_DIR` | `/opt/simple-next-prod` |
+| `VPS_STAGING_DIR` | `/opt/simple-next-staging` |
+
+Deploy tự động: push vào `dev` → staging; vào `main` → prod. **Deploy luôn chạy, kể cả
+khi gate đỏ** (`if: ${{ !cancelled() }}` + `needs`) — gate đỏ là cảnh báo để bạn quyết
+định, không phải chốt chặn. Bỏ dòng `if` đó là deploy bị skip khi gate đỏ.
+
+Deploy **không** chạy trong `pull_request` (workflow chỉ khai báo `on: push`), nên mỗi
+PR không tốn một lần build trên VPS. Ngoài ra GitHub không cấp secret cho workflow
+chạy bởi PR từ fork — càng không nên dựa vào nó.
+
+Deploy tay (VD VPS vừa setup lại, cần chạy lại không cần commit gì mới): tab
+**Actions → deploy → Run workflow**, chọn `target` và nhập `ref` (branch hoặc commit
+SHA, bỏ trống = nhánh theo môi trường).
+
+Bảo vệ tương đương "protected variable" của GitLab là **Environment protection rules**:
+tạo environment `prod`, thêm rule "Required reviewers" để chỉ workflow được duyệt mới
+nhận secret `prod-*`. Lưu ý *required reviewers* chỉ miễn phí với repo **public**;
+repo private cần Pro/Team/Enterprise. Repo public thì runner free không giới hạn phút.
+
+## 4. Deploy / quay lại bản cũ (thủ công)
+
+```bash
+# deploy (thường không cần — workflow tự gọi)
+cd /opt/simple-next-prod
+bash deploy/vps/deploy.sh main prod
+
+# xem commit đang chạy
+git -C /opt/simple-next-prod log -1 --oneline
+```
+
+**Không có `rollback.sh` và không có bản build dự phòng trên đĩa.** Mô hình 1 thư mục
+chỉ giữ đúng một bản build, nên quay lại bản cũ = build lại:
+
+- **Deploy fail** (build hỏng / health không khỏe) → `deploy.sh` tự checkout về commit
+  trước, build lại, start lại. Không cần can thiệp.
+- **Deploy thành công nhưng app lỗi chức năng** → deploy lại một nhánh/commit tốt:
+
+  ```bash
+  cd /opt/simple-next-prod
+  bash deploy/vps/deploy.sh <nhánh-tốt> prod
+  # deploy đúng một commit cũ:
+  git -C /opt/simple-next-prod fetch origin <nhánh> \
+    && bash deploy/vps/deploy.sh <commit-sha> prod
+  ```
+
+Biến ghi đè được: `HEALTH_TIMEOUT` (mặc định 90), `VPS_BASE`, `VPS_SECRETS`,
+`PROD_PORT`, `STAGING_PORT`.
+
+Log: `pm2 logs simple-next-prod --lines 50` · `pm2 logs simple-next-staging --lines 50`
+
+## 5. Kiểm tra sau khi deploy
+
+```bash
+curl -fsS http://127.0.0.1:3119/api/health    # từ VPS (prod)
+curl -fsS http://127.0.0.1:3118/api/health    # staging
+curl -I http://<IP-VPS>:8019                  # từ ngoài
+```
+
+Mở `http://<IP-VPS>:8019` — trang hiện `Git SHA` và `Build time`: đó là commit vừa
+deploy. Nếu `X-Real-IP` / `X-Forwarded-Proto` hiện `(missing)` thì nginx chưa forward
+header đúng.
+
+Deploy lại **cùng một commit** mà app đang khỏe là no-op (deploy.sh log
+`đã ở <sha> và app khỏe — không làm gì`) — dùng để kiểm tra workflow mà không đụng app.
+
+## 6. Khi đã có domain + HTTPS
+
+1. Trỏ DNS về VPS, cấp cert (certbot).
+2. Sửa **file đang chạy** `/etc/nginx/sites-available/simple-next` theo khối hướng dẫn
+   cuối `deploy/vps/nginx.conf`: thêm `server_name`, `listen 443 ssl`, đổi `listen 8019`
+   thành redirect 301. Nhớ **commit ngược lại** vào `deploy/vps/nginx.conf` trong repo.
+3. `sudo nginx -t && sudo systemctl reload nginx`.
+4. Sửa secret `VPS_HOST` thành domain. Muốn deploy chỉ chạy khi có người duyệt thì
+   dùng Environment protection rules (xem §3).
+
+## 7. Ghi chú vận hành
+
+- **Dung lượng đĩa:** mỗi môi trường chỉ có MỘT bản build (`node_modules` + `.next`),
+  tức ~300MB/môi trường. Không có thư mục release tích tụ theo thời gian.
+- **Giới hạn RAM:** `NODE_OPTIONS=--max-old-space-size=256` trong
+  `ecosystem.config.cjs`, **không** dùng `max_memory_restart` của pm2 — khi `script` là
+  `npm`, pm2 chỉ đo tiến trình `npm` chứ không đo `next`, ngưỡng đó là vanh tính giả.
+- **Deploy fail = an toàn:** script quay về commit trước, build lại, start lại, trả exit 1
+  (workflow đỏ). Nếu app vẫn hỏng sau khi quay về thì lỗi nằm ở env/cấu hình.
+- **Thư mục clone ở detached HEAD:** đừng `git pull`/`git checkout` tay trong
+  `/opt/simple-next-*` khi app đang chạy. Mọi thay đổi code trên VPS phải đi qua
+  `deploy.sh`.

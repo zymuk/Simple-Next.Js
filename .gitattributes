@@ -1,0 +1,23 @@
+# Script chạy trên VPS phải là LF. Windows tự đổi thành CRLF khi checkout sẽ làm
+# `bash deploy/vps/deploy.sh` chết với `set -euo pipefail^M` / `$'\r': command not
+# found`, mà lỗi đó chỉ hiện ra trên VPS chứ không phải trên máy local.
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.cjs text eol=lf
+*.yml text eol=lf
+*.conf text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.css text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+
+# Ảnh/binary: đừng đụng
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
