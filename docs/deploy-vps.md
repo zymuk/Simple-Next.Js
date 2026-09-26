@@ -11,7 +11,7 @@ trên cùng VPS, và CI là **GitHub Actions** (`.github/workflows/deploy.yml`).
 | staging | `dev` | `:8018` | `127.0.0.1:3118` | `http://<IP-VPS>:8018` |
 | prod | `main` | `:8019` | `127.0.0.1:3119` | `http://<IP-VPS>:8019` |
 
-Cổng khác `mom-baby-app` (`:80 → 3000`, `:3001 → 3002`) để không đụng nhau.
+Cổng khác `mom-baby-app` (`:80 → 3000`, `:8001 → 3002`) để không đụng nhau.
 
 App chỉ lắng nghe trên loopback → **không truy cập trực tiếp được**, mọi request đi qua
 nginx (giữ `X-Real-IP` / `X-Forwarded-Proto` mà trang `/` hiển thị để kiểm chứng).
@@ -189,7 +189,7 @@ Ba thứ phải không trùng, trùng là `nginx -t` fail ⇒ `systemctl reload`
 mất nginx cho **cả VPS**:
 
 1. **Tên file** trong `sites-available`/`sites-enabled` (`simple-next` vs `mom-baby`).
-2. **Cổng `listen`.** Đang phân bổ: mom-baby `80` (prod) + `3001` (staging) →
+2. **Cổng `listen`.** Đang phân bổ: mom-baby `80` (prod) + `8001` (staging) →
    `127.0.0.1:3000/3002`; simple-next `8019` (prod) + `8018` (staging) →
    `127.0.0.1:3119/3118`.
 3. **Tên `upstream`** — `upstream` là namespace **toàn cục**, không nằm trong
@@ -252,7 +252,7 @@ Kiểm tra:
 
 ```bash
 ls -l /etc/nginx/sites-enabled/
-sudo ss -ltnp | grep -E ':(80|3001|3118|3119|8018|8019)\b'
+sudo ss -ltnp | grep -E ':(80|8001|3118|3119|8018|8019)\b'
 curl -sI http://127.0.0.1:80   | head -1   # mom-baby prod
 curl -sI http://127.0.0.1:8019 | head -1   # simple-next prod
 ```
@@ -389,9 +389,25 @@ curl -fsS http://127.0.0.1:3118/api/health    # staging
 curl -I http://<IP-VPS>:8019                  # từ ngoài
 ```
 
-Mở `http://<IP-VPS>:8019` — trang hiện `Git SHA` và `Build time`: đó là commit vừa
-deploy. Nếu `X-Real-IP` / `X-Forwarded-Proto` hiện `(missing)` thì nginx chưa forward
-header đúng.
+`/api/health` trả kèm bản build đang chạy — đây là cách **không cần mở trình duyệt**
+để biết VPS đang phục vụ commit nào:
+
+```json
+{ "status": "ok", "version": "0.1.0", "sha": "fc70613",
+  "builtAt": "2026-09-27T01:26:18+07:00", "uptime": 6, "node": "v26.5.0", "time": "..." }
+```
+
+So `sha` với `git -C /opt/simple-next-prod rev-parse --short=7 HEAD` là kiểm tra
+nhanh nhất xem VPS có đúng commit bạn vừa push không. `sha`/`builtAt` được inline
+lúc `npm run build` nên luôn mô tả đúng code đang chạy; `null` nghĩa là bản build đó
+không đi qua `deploy.sh` (thường là build tay ở máy dev).
+
+Deploy lùi về commit trước cũng tự đổi `sha` ở đây — nên sau một lần deploy, đọc
+`sha` là biết app đang ở bản nào, kể cả bản rollback.
+
+Mở `http://<IP-VPS>:8019` — trang hiện `Version`, `Git SHA` và `Build time`: đó là
+commit vừa deploy. Nếu `X-Real-IP` / `X-Forwarded-Proto` hiện `(missing)` thì nginx
+chưa forward header đúng.
 
 Deploy lại **cùng một commit** mà app đang khỏe là no-op (deploy.sh log
 `đã ở <sha> và app khỏe — không làm gì`) — dùng để kiểm tra workflow mà không đụng app.

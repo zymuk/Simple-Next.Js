@@ -1,5 +1,7 @@
 import { headers } from "next/headers";
 
+import { BUILD_INFO } from "@/lib/buildInfo";
+
 export const dynamic = "force-dynamic";
 
 const startedAt = Date.now();
@@ -21,8 +23,9 @@ export default async function Home() {
     { label: "PORT", value: process.env.PORT ?? "(default 3000)" },
     { label: "NODE_ENV", value: process.env.NODE_ENV ?? "-" },
     { label: "APP_MESSAGE", value: process.env.APP_MESSAGE ?? "(not set)" },
-    { label: "Git SHA", value: process.env.NEXT_PUBLIC_GIT_SHA ?? "(not set)" },
-    { label: "Build time", value: process.env.NEXT_PUBLIC_BUILD_TIME ?? "-" },
+    { label: "Version", value: BUILD_INFO.version },
+    { label: "Git SHA", value: BUILD_INFO.sha ?? "(not set)" },
+    { label: "Build time", value: BUILD_INFO.builtAt ?? "-" },
   ];
 
   const request = [

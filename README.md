@@ -8,11 +8,38 @@ SSH → VPS (pm2 + nginx, không Docker), cùng mô hình với `mom-baby-app`.
 | staging | `dev` | `:8018` | `127.0.0.1:3118` | `http://<IP-VPS>:8018` |
 | prod | `main` | `:8019` | `127.0.0.1:3119` | `http://<IP-VPS>:8019` |
 
-- `/` — server-rendered mỗi request, hiện Node version, uptime, `NEXT_PUBLIC_GIT_SHA` /
-  `NEXT_PUBLIC_BUILD_TIME` (tức commit + thời điểm build của bản đang chạy) và các
-  header nhận được từ nginx.
-- `/api/health` — JSON `{ status, uptime, node, time }`, dùng cho health check và cho
-  `deploy.sh` quyết định rollback.
+- `/` — server-rendered mỗi request, hiện Node version, uptime, version + commit + thời
+  điểm build của bản đang chạy và các header nhận được từ nginx.
+- `/api/health` — JSON `{ status, version, sha, builtAt, uptime, node, time }`, dùng cho
+  health check và cho `deploy.sh` quyết định rollback.
+
+### Biết app đang chạy commit nào
+
+```bash
+curl -fsS http://127.0.0.1:3119/api/health    # trên VPS (prod)
+curl -fsS http://<IP-VPS>:8019/api/health     # từ ngoài
+```
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "sha": "fc70613",
+  "builtAt": "2026-09-27T01:26:18+07:00",
+  "uptime": 6,
+  "node": "v26.5.0",
+  "time": "2026-09-27T01:26:47.665Z"
+}
+```
+
+`sha` và `builtAt` được `deploy.sh` export **trước** `npm run build`, nên Next **inline
+chúng vào bundle lúc build** — không đọc lúc runtime. Nhờ vậy hai giá trị này luôn mô
+tả đúng code đang chạy, kể cả sau `pm2 restart` mà không rebuild, và không bị lệch khi
+repo được `git checkout` sang commit khác. Build không đi qua `deploy.sh` (ví dụ ở máy
+dev) thì `sha` và `builtAt` là `null` — đó là câu trả lời trung thực, không phải lỗi.
+
+`version` đọc từ `package.json`, không hardcode lần 2. Nguồn sự thật cho cả `/` và
+`/api/health` là [`lib/buildInfo.ts`](./lib/buildInfo.ts).
 
 ## Local
 
