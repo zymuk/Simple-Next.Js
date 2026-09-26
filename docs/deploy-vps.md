@@ -156,8 +156,61 @@ target chưa tồn tại — nó tạo symlink treo, `nginx -t` sẽ fail với
 `open() ".../sites-enabled/simple-next" failed (2: No such file or directory)`. Sửa: chạy
 lại đúng chuỗi trên (tạo file đích trước rồi mới link).
 
-Không `rm /etc/nginx/sites-enabled/default` ở đây (khác mom-baby) vì file này **không**
-dùng `listen 80 default_server` — xóa sẽ làm hỏng app kia.
+### 2.5b Nhiều project trên cùng một VPS
+
+nginx chỉ có MỘT config toàn cục (`/etc/nginx/nginx.conf` → `include
+sites-enabled/*`). Mỗi project là 1 cặp file riêng trong `sites-available/` +
+`sites-enabled/`; **không** sửa file của project khác.
+
+Ba thứ phải không trùng, trùng là `nginx -t` fail ⇒ `systemctl reload` không chạy ⇒
+mất nginx cho **cả VPS**:
+
+1. **Tên file** trong `sites-available`/`sites-enabled` (`simple-next` vs `mom-baby`).
+2. **Cổng `listen`.** Đang phân bổ: mom-baby `80` (prod) + `3001` (staging) →
+   `127.0.0.1:3000/3002`; simple-next `8019` (prod) + `8018` (staging) →
+   `127.0.0.1:3119/3118`.
+3. **Tên `upstream`** — `upstream` là namespace **toàn cục**, không nằm trong
+   `server {}`. Đây là chỗ dễ vấp nhất: file này dùng `simple_next_prod` /
+   `simple_next_staging`, còn mom-baby dùng `mom_baby_prod` / `mom_baby_staging`.
+   Nếu cả hai cùng đặt `upstream prod` thì `nginx -t` báo `duplicate upstream`.
+
+**`sites-enabled/default` phải bị gỡ** — nhưng **không phải vì simple-next**. File
+`default` của Ubuntu cũng khai `listen 80 default_server`, mà `mom-baby` dùng chính
+cổng 80 với `default_server` (`listen 80 default_server` trong
+`deploy/vps/nginx.conf` của nó) ⇒ hai block cùng làm default trên `:80` ⇒
+`duplicate default server for 0.0.0.0:80`. mom-baby đã gỡ file này trong
+setup của nó; simple-next chỉ cần đảm bảo nó vẫn vắng:
+
+```bash
+sudo rm -f /etc/nginx/sites-enabled/default
+```
+
+Thứ tự cài (chạy 1 lần; cài mom-baby trước vì nó giữ `default_server` trên :80):
+
+```bash
+sudo install -m 644 /opt/mom-baby-prod/deploy/vps/nginx.conf /etc/nginx/sites-available/mom-baby \
+  && sudo ln -sfn /etc/nginx/sites-available/mom-baby /etc/nginx/sites-enabled/mom-baby
+
+sudo rm -f /etc/nginx/sites-enabled/default
+
+sudo install -m 644 /opt/simple-next-prod/deploy/vps/nginx.conf /etc/nginx/sites-available/simple-next \
+  && sudo ln -sfn /etc/nginx/sites-available/simple-next /etc/nginx/sites-enabled/simple-next
+
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Kiểm tra:
+
+```bash
+ls -l /etc/nginx/sites-enabled/
+sudo ss -ltnp | grep -E ':(80|3001|3118|3119|8018|8019)\b'
+curl -sI http://127.0.0.1:80   | head -1   # mom-baby prod
+curl -sI http://127.0.0.1:8019 | head -1   # simple-next prod
+```
+
+Khi cả hai lên HTTPS, cùng phải khai `listen 443 ssl` — lúc đó chỉ MỘT block được
+`default_server`, các block còn lại bắt buộc có `server_name` khác nhau, nếu không
+lại dính `duplicate default server`.
 
 ```bash
 # pm2 tự khởi động lại sau reboot
